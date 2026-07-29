@@ -1,17 +1,12 @@
 /*
- * ESP32 UDP Packet Display Test
+ * TEST_Packet_Receiver.ino - DEBUG VERSION
  * 
- * Connects to WiFi and displays received UDP packets in a readable format.
- * Shows connection status, timestamps, and complete packet details.
- * 
- * Packet format (matching udp.py):
- *   Header: command (1B) + packet_number (4B) + num_robots (1B) = 6 bytes
- *   Each robot: robot_id (1B) + x (4B float) + y (4B float) + theta (4B float) = 13 bytes
+ * ESP32 UDP Packet Receiver for server testing
+ * With detailed rate calculation debugging
  */
 
 #include <WiFi.h>
 #include <WiFiUdp.h>
-#include <time.h>
 
 // ─── WiFi Configuration ──────────────────────────────────────────────────────
 const char* WIFI_SSID = "AgentWifi";
@@ -19,102 +14,52 @@ const char* WIFI_PASSWORD = "12345678";
 
 // ─── UDP Configuration ───────────────────────────────────────────────────────
 const uint16_t UDP_PORT = 5005;
-const size_t UDP_BUFFER_SIZE = 256;
 
-// ─── Global Objects ──────────────────────────────────────────────────────────
+// ─── Global Objects ────────────────────────────────────────────────────────
 WiFiUDP udpServer;
+
+// ─── Packet Tracking ───────────────────────────────────────────────────────
+unsigned long total_packets = 0;
 unsigned long last_packet_time = 0;
-uint32_t packet_count = 0;
+unsigned long prev_packet_time = 0;
+
+// ─── Rate Tracking - Store last 3 intervals ────────────────────────────────
+unsigned long interval1 = 0;  // Most recent
+unsigned long interval2 = 0;  // Second most recent
+unsigned long interval3 = 0;  // Third most recent
+
 bool wifi_connected = false;
-
-// ─── Display formatting constants ────────────────────────────────────────────
-const char* DIVIDER = "════════════════════════════════════════════════════════════════";
-
-// ─── Function prototypes ─────────────────────────────────────────────────────
-void setup_wifi();
-void setup_ntp();
-String get_formatted_time();
-void display_wifi_status();
-void parse_and_display_packet(const uint8_t* data, size_t length);
 
 // ═════════════════════════════════════════════════════════════════════════════
 void setup() {
   Serial.begin(115200);
-  delay(1000);  // Allow serial to initialize
+  delay(1000);
 
-  Serial.println("\n\n");
-  Serial.println(DIVIDER);
-  Serial.println("  ESP32 UDP PACKET DISPLAY TEST");
-  Serial.println(DIVIDER);
-  Serial.println();
+  Serial.println("\n");
+  Serial.println("ESP32 UDP Packet Receiver - DEBUG");
+  Serial.println("=================================\n");
 
-  // Setup WiFi connection
   setup_wifi();
 
-  // Setup NTP for accurate timestamps
-  setup_ntp();
-
-  // Start UDP server
   if (udpServer.begin(UDP_PORT)) {
-    Serial.printf("[UDP] Server listening on port %d\n\n", UDP_PORT);
+    Serial.printf("Listening on port %d\n", UDP_PORT);
+    Serial.println("Waiting for packets...\n");
   } else {
-    Serial.println("[ERROR] Failed to start UDP server!");
+    Serial.println("ERROR: Failed to start UDP server!");
   }
 
-  display_wifi_status();
+  last_packet_time = millis();
+  prev_packet_time = millis();
 }
 
-// ═════════════════════════════════════════════════════════════════════════════
-void loop() {
-  // Check WiFi connection
-  if (WiFi.status() == WL_CONNECTED) {
-    if (!wifi_connected) {
-      wifi_connected = true;
-      display_wifi_status();
-    }
-
-    // Check for incoming UDP packets
-    int packet_size = udpServer.parsePacket();
-    if (packet_size > 0) {
-      // Allocate buffer for packet data
-      uint8_t* buffer = new uint8_t[packet_size];
-      int bytes_read = udpServer.read(buffer, packet_size);
-
-      if (bytes_read > 0) {
-        packet_count++;
-        last_packet_time = millis();
-
-        // Display the packet
-        parse_and_display_packet(buffer, bytes_read);
-      }
-
-      delete[] buffer;
-    }
-  } else {
-    if (wifi_connected) {
-      wifi_connected = false;
-      Serial.println("\n[!] WiFi connection lost!");
-      display_wifi_status();
-    }
-  }
-
-  delay(10);  // Small delay to prevent watchdog issues
-}
-
-// ═════════════════════════════════════════════════════════════════════════════
-// SETUP: Initialize WiFi connection
 // ═════════════════════════════════════════════════════════════════════════════
 void setup_wifi() {
-  Serial.println("[WiFi] Connecting to network...");
-  Serial.printf("  SSID: %s\n", WIFI_SSID);
-
+  Serial.print("Connecting to WiFi...");
   WiFi.mode(WIFI_STA);
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
 
   int attempts = 0;
-  int max_attempts = 20;  // 10 seconds with 500ms delays
-
-  while (WiFi.status() != WL_CONNECTED && attempts < max_attempts) {
+  while (WiFi.status() != WL_CONNECTED && attempts < 20) {
     delay(500);
     Serial.print(".");
     attempts++;
@@ -124,144 +69,104 @@ void setup_wifi() {
 
   if (WiFi.status() == WL_CONNECTED) {
     wifi_connected = true;
-    Serial.println("[✓] WiFi Connected!");
+    Serial.printf("Connected! IP: %s\n", WiFi.localIP().toString().c_str());
+    Serial.printf("Signal: %d dBm\n\n", WiFi.RSSI());
   } else {
     wifi_connected = false;
-    Serial.println("[✗] WiFi Connection Failed!");
+    Serial.println("Connection Failed!\n");
   }
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
-// SETUP: Initialize NTP time synchronization
-// ═════════════════════════════════════════════════════════════════════════════
-void setup_ntp() {
-  Serial.println("[NTP] Synchronizing time with NTP server...");
-
-  // Configure time with NTP server (timezone offset in seconds, DST offset)
-  configTime(0, 0, "pool.ntp.org", "time.nist.gov", "time.google.com");
-
-  // Wait for time to be set
-  time_t now = time(nullptr);
-  int attempts = 0;
-  while (now < 24 * 3600 && attempts < 20) {
-    delay(500);
-    Serial.print(".");
-    now = time(nullptr);
-    attempts++;
-  }
-
-  Serial.println();
-  if (now > 24 * 3600) {
-    Serial.println("[✓] Time synchronized");
-  } else {
-    Serial.println("[!] Time sync incomplete (packets will still display)");
-  }
-}
-
-// ═════════════════════════════════════════════════════════════════════════════
-// DISPLAY: Format current time as readable string
-// ═════════════════════════════════════════════════════════════════════════════
-String get_formatted_time() {
-  time_t now = time(nullptr);
-  struct tm* timeinfo = localtime(&now);
-
-  char buffer[32];
-  strftime(buffer, sizeof(buffer), "%Y-%m-%d %H:%M:%S", timeinfo);
-  return String(buffer);
-}
-
-// ═════════════════════════════════════════════════════════════════════════════
-// DISPLAY: Show WiFi connection status
-// ═════════════════════════════════════════════════════════════════════════════
-void display_wifi_status() {
-  Serial.println(DIVIDER);
-  Serial.println("WiFi STATUS:");
-  Serial.println(DIVIDER);
-
+void loop() {
   if (WiFi.status() == WL_CONNECTED) {
-    Serial.printf("  Status:     ✓ CONNECTED\n");
-    Serial.printf("  SSID:       %s\n", WiFi.SSID().c_str());
-    Serial.printf("  IP Address: %s\n", WiFi.localIP().toString().c_str());
-    Serial.printf("  Gateway:    %s\n", WiFi.gatewayIP().toString().c_str());
-    Serial.printf("  Signal:     %d dBm\n", WiFi.RSSI());
-  } else {
-    Serial.printf("  Status:     ✗ DISCONNECTED\n");
-    Serial.printf("  Reason:     %d\n", WiFi.status());
-  }
-
-  Serial.println();
-}
-
-// ═════════════════════════════════════════════════════════════════════════════
-// PARSE: Extract and display UDP packet contents
-// ═════════════════════════════════════════════════════════════════════════════
-void parse_and_display_packet(const uint8_t* data, size_t length) {
-  // Check minimum header size (6 bytes)
-  if (length < 6) {
-    Serial.println("\n[!] Packet too small (< 6 bytes)");
-    return;
-  }
-
-  // Extract header (6 bytes total)
-  char command_byte = data[0];
-  uint32_t packet_number = (data[1] << 24) | (data[2] << 16) | (data[3] << 8) | data[4];
-  uint8_t num_robots = data[5];
-  const char* command_str = (command_byte == 'R') ? "RUN" : "STOP";
-
-  // Verify packet size is correct
-  size_t expected_size = 6 + (num_robots * 13);  // 6 byte header + 13 bytes per robot
-  if (length < expected_size) {
-    Serial.printf("\n[!] Packet size mismatch! Got %d bytes, expected %d\n", length, expected_size);
-    return;
-  }
-
-  // ─── Display packet header ───────────────────────────────────────────────────
-  Serial.println();
-  Serial.println(DIVIDER);
-  Serial.printf("PACKET #%lu | Time: %s\n", packet_count, get_formatted_time().c_str());
-  Serial.println(DIVIDER);
-
-  Serial.printf("  Packet Number: %u (0x%08X)\n", packet_number, packet_number);
-  Serial.printf("  Command:       %s (%c)\n", command_str, command_byte);
-  Serial.printf("  Num Robots:    %u\n", num_robots);
-  Serial.printf("  Total Size:    %u bytes\n", length);
-  Serial.println();
-
-  // ─── Display robot data ──────────────────────────────────────────────────────
-  if (num_robots > 0) {
-    Serial.println("ROBOT DATA:");
-    Serial.println("─────────────────────────────────────────────────────────────────");
-
-    for (uint8_t i = 0; i < num_robots; i++) {
-      // Extract robot entry (13 bytes each)
-      size_t offset = 6 + (i * 13);
-
-      uint8_t robot_id = data[offset];
-
-      // Extract floats (4 bytes each, big-endian)
-      float x = extract_float(data, offset + 1);
-      float y = extract_float(data, offset + 5);
-      float theta = extract_float(data, offset + 9);
-
-      // Display robot entry
-      Serial.printf("  [Robot %u]\n", robot_id);
-      Serial.printf("    Position: x=%.4f m, y=%.4f m\n", x, y);
-      Serial.printf("    Angle:    θ=%.4f rad (%.2f°)\n", theta, theta * 57.2958f);  // Convert rad to degrees
-      Serial.println();
+    if (!wifi_connected) {
+      wifi_connected = true;
+      Serial.println("WiFi reconnected!\n");
     }
+
+    int packet_size = udpServer.parsePacket();
+
+    if (packet_size > 0) {
+      unsigned long current_time = millis();
+      
+      uint8_t* buffer = new uint8_t[packet_size];
+      int bytes_read = udpServer.read(buffer, packet_size);
+
+      if (bytes_read > 0 && bytes_read >= 6) {
+        // Extract header
+        char command_byte = buffer[0];
+        
+        // Packet number: bytes 1-4 (big-endian)
+        uint32_t server_pkt_num = ((uint32_t)buffer[1] << 24) | 
+                                  ((uint32_t)buffer[2] << 16) | 
+                                  ((uint32_t)buffer[3] << 8) | 
+                                  ((uint32_t)buffer[4]);
+        
+        uint8_t num_robots = buffer[5];
+
+        // Calculate time since last packet
+        unsigned long time_since_last = current_time - last_packet_time;
+        
+        // Shift intervals
+        interval3 = interval2;
+        interval2 = interval1;
+        interval1 = time_since_last;
+
+        // Calculate rate from last 3 intervals
+        float rate = 0.0;
+        if (interval1 > 0 && interval2 > 0 && interval3 > 0) {
+          unsigned long avg_interval = (interval1 + interval2 + interval3) / 3;
+          if (avg_interval > 0) {
+            rate = 1000.0 / (float)avg_interval;
+          }
+        } else if (interval1 > 0 && interval2 > 0) {
+          unsigned long avg_interval = (interval1 + interval2) / 2;
+          if (avg_interval > 0) {
+            rate = 1000.0 / (float)avg_interval;
+          }
+        }
+
+        last_packet_time = current_time;
+        total_packets++;
+
+        // Display packet info
+        Serial.printf("Pkt #%lu | Server #%u | Interval: %lu ms | Rate: %.1f Hz\n",
+                      total_packets, server_pkt_num, time_since_last, rate);
+
+        // Display robot positions
+        if (num_robots > 0 && (6 + num_robots * 13) <= bytes_read) {
+          for (int i = 0; i < num_robots; i++) {
+            size_t offset = 6 + (i * 13);
+            
+            if (offset + 13 > bytes_read) {
+              break;
+            }
+            
+            uint8_t robot_id = buffer[offset];
+            
+            // Parse floats
+            float x, y, theta;
+            memcpy(&x, &buffer[offset + 1], 4);
+            memcpy(&y, &buffer[offset + 5], 4);
+            memcpy(&theta, &buffer[offset + 9], 4);
+
+            Serial.printf("  Robot %d: x=%.2f y=%.2f theta=%.1f\n",
+                          robot_id, x, y, theta * 57.2958);
+          }
+        }
+        Serial.println();
+      }
+
+      delete[] buffer;
+    }
+
   } else {
-    Serial.println("  (No robots in this packet)\n");
+    if (wifi_connected) {
+      wifi_connected = false;
+      Serial.println("WiFi lost!\n");
+    }
   }
 
-  Serial.println(DIVIDER);
-  Serial.println();
-}
-
-// ═════════════════════════════════════════════════════════════════════════════
-// UTILITY: Extract big-endian float from byte array
-// ═════════════════════════════════════════════════════════════════════════════
-float extract_float(const uint8_t* data, size_t offset) {
-  uint8_t bytes[4] = {data[offset], data[offset + 1], data[offset + 2], data[offset + 3]};
-  float* ptr = (float*)bytes;
-  return *ptr;
+  delay(1);
 }
