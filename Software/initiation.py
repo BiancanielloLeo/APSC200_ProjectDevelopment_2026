@@ -2,6 +2,10 @@
 initiation.py - Swarm Initialisation Entry Point
 Prompts the user for robot configuration, starts the UDP broadcast server,
 launches the camera tracker, and provides a manual STOP command interface.
+
+KEY CHANGES:
+- No background broadcast loop (packets sent on-demand by tracker)
+- Server is started but waits for tracker to send packets immediately after processing
 """
 
 import threading
@@ -11,52 +15,13 @@ from udp import UDPServer
 from tracker import CameraTracker
 
 
-def get_robot_config() -> tuple[int, list[int]]:
-    """Prompt the user for the number of robots and their IDs."""
+def print_startup_message():
+    """Display startup message."""
     print("=" * 50)
     print("  Robot Swarm — Initiation")
     print("=" * 50)
-
-    while True:
-        try:
-            num_robots = int(input("\nHow many robots are being used? "))
-            if num_robots < 1:
-                print("  Please enter at least 1.")
-                continue
-            break
-        except ValueError:
-            print("  Invalid input — enter a whole number.")
-
-    print(f"\nEnter the ArUco marker ID for each of the {num_robots} robot(s).")
-    print("(IDs must match the 4x4_50 dictionary markers attached to the robots.)\n")
-
-    robot_ids = []
-    for i in range(num_robots):
-        while True:
-            try:
-                rid = int(input(f"  Robot {i + 1} marker ID: "))
-                if rid in robot_ids:
-                    print(f"  ID {rid} already used — choose a different one.")
-                    continue
-                robot_ids.append(rid)
-                break
-            except ValueError:
-                print("  Invalid input — enter a whole number.")
-
-    return num_robots, robot_ids
-
-
-def print_status(robot_ids: list[int], server: UDPServer):
-    """Display a summary of the active configuration."""
-    print("\n" + "=" * 50)
-    print("  Configuration Summary")
-    print("=" * 50)
-    print(f"  Active robots : {robot_ids}")
-    print(f"  Command state : {'RUN' if server.running else 'STOP'}")
-    print("=" * 50)
-    print("\nControls (type in this terminal while tracker runs):")
-    print("  [Enter]  → toggle RUN / STOP command")
-    print("  'q'      → quit everything\n")
+    print("\nAuto-detecting all ArUco markers (4x4_50 dictionary)...")
+    print("Waiting for camera feed...\n")
 
 
 def command_loop(server: UDPServer):
@@ -86,25 +51,27 @@ def command_loop(server: UDPServer):
 
 
 def main():
-    # ── 1. Get user configuration ─────────────────────────────────────────────
-    num_robots, robot_ids = get_robot_config()
+    # ── 1. Print startup message ──────────────────────────────────────────────
+    print_startup_message()
 
-    # ── 2. Start UDP server ───────────────────────────────────────────────────
+    # ── 2. Start UDP server (no background broadcast) ─────────────────────────
     server = UDPServer()
-    server.set_command(run=True)       # default: RUN
-    server.start(rate_hz=20.0)
-    print(f"[Init] UDP server started. Broadcasting at 20 Hz.")
+    server.set_command(run=False)      # default: STOP (safe state)
+    server.start(enable_background_broadcast=False)  # Packets sent on-demand
+    print(f"[Init] UDP server started (on-demand packet transmission).\n")
 
-    # ── 3. Print status and controls ──────────────────────────────────────────
-    print_status(robot_ids, server)
-
-    # ── 4. Start command listener in background ───────────────────────────────
+    # ── 3. Start command listener in background ───────────────────────────────
     cmd_thread = threading.Thread(target=command_loop, args=(server,), daemon=True)
     cmd_thread.start()
 
-    # ── 5. Start camera tracker (blocks until 'q' pressed in video window) ───
+    # ── 4. Start camera tracker (auto-detects all 4x4_50 markers) ─────────────
     try:
-        tracker = CameraTracker(server=server, active_robot_ids=robot_ids)
+        tracker = CameraTracker(server=server, active_robot_ids=None)  # None = detect all
+        print("=" * 50)
+        print("  Controls")
+        print("=" * 50)
+        print("  [Enter]  → toggle RUN / STOP command")
+        print("  'q'      → quit everything\n")
         tracker.run()
     except RuntimeError as e:
         print(f"[Init] Tracker error: {e}")

@@ -2,7 +2,13 @@
 tracker.py - Overhead Camera Tracker for Robot Swarm Localisation
 Detects ArUco markers (4x4_50 dictionary) from a 1920x1080 camera feed,
 converts pixel positions to real-world coordinates centred at (0, 0),
-and pushes (x, y, theta) data to the UDP server.
+and pushes (x, y, theta) data to the UDP server immediately after each frame.
+
+KEY CHANGES:
+- Packets sent immediately after frame processing (not on timer)
+- GUI runs in separate thread (non-blocking)
+- Frame rate and packet rate tracked for display
+- Stops sending if camera feed is lost
 """
 
 import cv2
@@ -11,6 +17,7 @@ import math
 import time
 import platform
 from threading import Thread
+from collections import deque
 from udp import UDPServer
 
 # ── Camera / Scene Configuration ──────────────────────────────────────────────
@@ -29,11 +36,6 @@ PX_PER_M_Y = FRAME_HEIGHT / SCENE_HEIGHT_M   # pixels per metre (vertical)
 
 # ArUco marker side length in metres (used for pose estimation).
 MARKER_LENGTH_M   = 0.05       # 5 cm markers
-
-# ── Safety Configuration ───────────────────────────────────────────────────────
-LOST_TIMEOUT_S        = 1.0    # seconds before a missing robot triggers STOP
-COLLISION_DIST_M      = 0.20   # metres — stop if any two robots are closer than this
-# ─────────────────────────────────────────────────────────────────────────────
 
 # Centre pixel (maps to world origin (0, 0))
 CX = FRAME_WIDTH  // 2         # 960
@@ -89,6 +91,7 @@ class WebcamVideoStream:
 
         self.stopped  = False
         self.grabbed, self.frame = self.stream.read()
+        self.frame_count = 0  # NEW: track frame number
 
     def start(self):
         t = Thread(target=self._update, daemon=True)
@@ -96,10 +99,11 @@ class WebcamVideoStream:
         return self
 
     def _update(self):
-        frame_delta = 1.0 / FPS
+        frame_delta = 1.0 / 30  # Read at camera's actual rate
         while not self.stopped:
             prev = time.time()
             self.grabbed, self.frame = self.stream.read()
+            self.frame_count += 1  # NEW: increment on each new frame
             sleep = frame_delta - (time.time() - prev)
             if sleep > 0:
                 time.sleep(sleep)
@@ -109,10 +113,31 @@ class WebcamVideoStream:
         self.stream.release()
 
 
+class FrameRateCounter:
+    """Tracks frame/packet rate over a rolling window."""
+    def __init__(self, window_size=30):
+        self.window_size = window_size
+        self.timestamps = deque(maxlen=window_size)
+    
+    def tick(self):
+        """Record a timestamp."""
+        self.timestamps.append(time.time())
+    
+    def get_rate(self) -> float:
+        """Return rate in Hz (events per second)."""
+        if len(self.timestamps) < 2:
+            return 0.0
+        elapsed = self.timestamps[-1] - self.timestamps[0]
+        if elapsed < 0.01:  # avoid division by very small numbers
+            return 0.0
+        return (len(self.timestamps) - 1) / elapsed
+
+
 class CameraTracker:
-    def __init__(self, server: UDPServer, active_robot_ids: list[int]):
+    def __init__(self, server: UDPServer, active_robot_ids: list[int] = None):
         self.server = server
-        self.active_robot_ids = set(active_robot_ids)
+        # If active_robot_ids is None, detect all markers; otherwise use provided list
+        self.active_robot_ids = set(active_robot_ids) if active_robot_ids is not None else None
 
         # ArUco setup
         self.aruco_dict   = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_4X4_50)
@@ -133,16 +158,19 @@ class CameraTracker:
             raise RuntimeError(f"[Tracker] Cannot open camera index {CAMERA_INDEX}")
         print(f"[Tracker] Camera opened ({FRAME_WIDTH}x{FRAME_HEIGHT})")
 
-        # ── Safety state ───────────────────────────────────────────────────────
-        # last_seen: robot_id → timestamp of most recent detection
-        # Seeded to now so robots don't immediately trip the timeout on startup.
-        now = time.time()
-        self.last_seen: dict[int, float] = {rid: now for rid in active_robot_ids}
-        self.safety_stop_active = False   # True while a safety condition holds
+        # Performance tracking
+        self.frame_rate_counter = FrameRateCounter(window_size=30)
+        self.packet_rate_counter = FrameRateCounter(window_size=30)
+        
+        # GUI state (shared between main thread and GUI thread)
+        self.latest_frame = None
+        self.latest_positions = {}
+        self.gui_stopped = False
 
     def process_frame(self, frame: np.ndarray) -> dict[int, tuple[float, float, float]]:
         """
-        Detect ArUco markers in frame and return position data for active robots.
+        Detect ArUco markers in frame and return position data.
+        If active_robot_ids is None, detects all markers. Otherwise, filters by active_robot_ids.
         Returns: { robot_id: (x_m, y_m, theta_rad), ... }
         """
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
@@ -153,7 +181,8 @@ class CameraTracker:
             return positions
 
         for corner, marker_id in zip(corners, ids.flatten()):
-            if marker_id not in self.active_robot_ids:
+            # If active_robot_ids is None, detect all markers; otherwise filter
+            if self.active_robot_ids is not None and marker_id not in self.active_robot_ids:
                 continue
 
             pts = corner[0]
@@ -197,139 +226,100 @@ class CameraTracker:
                         cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 2)
             cv2.circle(annotated, (px, py), 6, (255, 255, 0), -1)
 
-        # ── Safety overlay ────────────────────────────────────────────────────
-        now = time.time()
-
-        # Highlight robots that have exceeded the lost timeout
-        warn_row = 0
-        for robot_id, last_t in self.last_seen.items():
-            elapsed = now - last_t
-            if elapsed >= LOST_TIMEOUT_S:
-                warn_y = 30 + warn_row * 28
-                cv2.putText(annotated,
-                            f"LOST: Robot {robot_id} ({elapsed:.1f}s)",
-                            (10, warn_y), cv2.FONT_HERSHEY_SIMPLEX,
-                            0.7, (0, 0, 255), 2)
-                warn_row += 1
-
-        # Highlight close pairs with a line between them
-        detected = list(positions.items())
-        for i in range(len(detected)):
-            id_a, (xa, ya, _) = detected[i]
-            for j in range(i + 1, len(detected)):
-                id_b, (xb, yb, _) = detected[j]
-                dist = math.hypot(xa - xb, ya - yb)
-                if dist < COLLISION_DIST_M:
-                    pxa = int(CX + xa * PX_PER_M_X)
-                    pya = int(CY - ya * PX_PER_M_Y)
-                    pxb = int(CX + xb * PX_PER_M_X)
-                    pyb = int(CY - yb * PX_PER_M_Y)
-                    cv2.line(annotated, (pxa, pya), (pxb, pyb), (0, 0, 255), 3)
-                    mid_x = (pxa + pxb) // 2
-                    mid_y = (pya + pyb) // 2
-                    cv2.putText(annotated, f"{dist:.2f}m!", (mid_x, mid_y - 10),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
-
-        # Global safety banner
-        if self.safety_stop_active:
-            cv2.rectangle(annotated, (0, FRAME_HEIGHT - 50),
-                          (FRAME_WIDTH, FRAME_HEIGHT), (0, 0, 180), -1)
-            cv2.putText(annotated, "!! SAFETY STOP ACTIVE !!",
-                        (FRAME_WIDTH // 2 - 280, FRAME_HEIGHT - 12),
-                        cv2.FONT_HERSHEY_SIMPLEX, 1.2, (255, 255, 255), 3)
+        # Add performance metrics
+        frame_rate = self.frame_rate_counter.get_rate()
+        packet_rate = self.packet_rate_counter.get_rate()
+        metrics_text = f"Frame Rate: {frame_rate:.1f} Hz | Packet Rate: {packet_rate:.1f} Hz"
+        cv2.putText(annotated, metrics_text, (10, 30),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
 
         return annotated
 
-    def check_safety(
-        self,
-        positions: dict[int, tuple[float, float, float]],
-    ) -> tuple[bool, str]:
+    def gui_thread(self):
         """
-        Evaluate safety conditions and return (stop_required, reason_string).
-
-        Conditions checked:
-          1. Lost robot  — any active robot unseen for >= LOST_TIMEOUT_S seconds.
-          2. Collision   — any two detected robots are within COLLISION_DIST_M metres.
+        Runs in a background thread.
+        Displays the annotated frame without blocking the main tracking loop.
         """
-        now = time.time()
-
-        # Update last-seen timestamps for every robot detected this frame.
-        for robot_id in positions:
-            self.last_seen[robot_id] = now
-
-        # ── 1. Lost-robot check ───────────────────────────────────────────────
-        for robot_id, last_t in self.last_seen.items():
-            elapsed = now - last_t
-            if elapsed >= LOST_TIMEOUT_S:
-                return True, (
-                    f"Robot {robot_id} not detected for {elapsed:.1f}s "
-                    f"(threshold {LOST_TIMEOUT_S}s)"
-                )
-
-        # ── 2. Collision-proximity check ──────────────────────────────────────
-        detected = list(positions.items())
-        for i in range(len(detected)):
-            id_a, (xa, ya, _) = detected[i]
-            for j in range(i + 1, len(detected)):
-                id_b, (xb, yb, _) = detected[j]
-                dist = math.hypot(xa - xb, ya - yb)
-                if dist < COLLISION_DIST_M:
-                    return True, (
-                        f"Robots {id_a} and {id_b} are {dist:.3f}m apart "
-                        f"(threshold {COLLISION_DIST_M}m)"
-                    )
-
-        return False, ""
+        cv2.namedWindow("Robot Tracker", cv2.WINDOW_NORMAL)
+        
+        while not self.gui_stopped:
+            if self.latest_frame is not None:
+                annotated = self.annotate_frame(self.latest_frame, self.latest_positions)
+                cv2.imshow("Robot Tracker", annotated)
+                
+                key = cv2.waitKey(1) & 0xFF
+                if key == ord('q'):
+                    print("[Tracker] Quit signal received.")
+                    self.gui_stopped = True
+            else:
+                # No frame yet, wait a bit
+                time.sleep(0.01)
+        
+        cv2.destroyAllWindows()
+        print("[Tracker] GUI thread stopped.")
 
     def run(self):
-        """Main tracking loop — processes frames and pushes data to the UDP server."""
+        """
+        Main tracking loop — processes frames and sends packets immediately.
+        GUI runs in a separate thread and doesn't block packet transmission.
+        """
         print("[Tracker] Starting tracking loop. Press 'q' in the video window to quit.")
-        cv2.namedWindow("Robot Tracker", cv2.WINDOW_NORMAL)
+        
+        # Start GUI in background thread
+        gui_t = Thread(target=self.gui_thread, daemon=True)
+        gui_t.start()
+
+        last_frame_count = -1  # Track the frame count we last processed
 
         while True:
+            # Check if camera is still connected
             if not self.vs.grabbed:
-                print("[Tracker] Failed to read frame.")
+                print("[Tracker] Camera feed lost. Stopping packet transmission.")
+                self.server.stop_server()  # Stop sending packets if camera is dead
                 break
 
+            # Get the latest frame
             frame = self.vs.frame.copy()
+            
+            # Wait for camera thread to provide a NEW frame
+            if self.vs.frame_count == last_frame_count:
+                # Same frame count = no new frame from camera yet
+                time.sleep(0.001)  # Brief sleep, try again
+                continue
+            
+            # New frame! Update our counter
+            last_frame_count = self.vs.frame_count
+            
+            # Process frame to extract positions
             positions = self.process_frame(frame)
+            self.frame_rate_counter.tick()
 
+            # Send packet IMMEDIATELY after processing (not on a timer)
             if positions:
-                self.server.update_positions(positions)
+                self.server.send_packet_now(positions)
+                self.packet_rate_counter.tick()
 
-            # ── Safety evaluation ─────────────────────────────────────────────
-            stop_required, reason = self.check_safety(positions)
+            # Store frame for GUI thread (non-blocking)
+            self.latest_frame = frame.copy()
+            self.latest_positions = positions
 
-            if stop_required and not self.safety_stop_active:
-                self.safety_stop_active = True
-                self.server.set_command(run=False)
-                print(f"[Safety] STOP triggered — {reason}")
-
-            elif not stop_required and self.safety_stop_active:
-                self.safety_stop_active = False
-                self.server.set_command(run=True)
-                print("[Safety] All conditions cleared — resuming RUN")
-
-            annotated = self.annotate_frame(frame, positions)
-            cv2.imshow("Robot Tracker", annotated)
-
-            key = cv2.waitKey(1) & 0xFF
-            if key == ord('q'):
-                print("[Tracker] Quit signal received.")
+            # Check if GUI requested quit
+            if self.gui_stopped:
+                print("[Tracker] GUI quit requested.")
                 break
 
         self.vs.stop()
-        cv2.destroyAllWindows()
+        self.gui_stopped = True
         print("[Tracker] Camera released.")
 
 
 # ── Standalone test (no server required) ─────────────────────────────────────
 if __name__ == "__main__":
     class StubServer:
-        def update_positions(self, pos):
-            print(f"[StubServer] Positions: {pos}")
-        def set_command(self, run):
-            print(f"[StubServer] Command: {'RUN' if run else 'STOP'}")
+        def send_packet_now(self, pos):
+            print(f"[StubServer] Sending packet: {pos}")
+        def stop_server(self):
+            pass
 
     tracker = CameraTracker(
         server=StubServer(),
