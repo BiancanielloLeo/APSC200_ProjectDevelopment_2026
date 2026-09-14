@@ -34,10 +34,10 @@
 
 // ── Identity ───────────────────────────────────────────────────────────────
 // Must match the ArUco marker AND be in the ID list typed into initiation.py.
-#define THIS_ROBOT_ID   1
+#define THIS_ROBOT_ID   4
 
 // ── Network (must match udp.py) ────────────────────────────────────────────
-#define WIFI_SSID       "RobotWifi"
+#define WIFI_SSID       "AgentWifi"
 #define WIFI_PASSWORD   "12345678"
 #define UDP_PORT        5005
 

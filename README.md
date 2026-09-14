@@ -7,6 +7,5 @@ When navigating the repository:
 + The "Firmware" folder contains all the code to be ran on the robots.
 + The "Hardware" folder contains all the CAD models for the robots.
 
-
 #Past Repositories
 + https://github.com/Shaquible/2022AppleMathAPSC200Robots

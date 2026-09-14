@@ -15,7 +15,7 @@ import threading
 import time
 
 # ── Network Configuration ─────────────────────────────────────────────────────
-WIFI_SSID     = "RobotWifi"             # Wi-Fi network name
+WIFI_SSID     = "AgentWifi"             # Wi-Fi network name
 WIFI_PASSWORD = "12345678"              # Wi-Fi password
 SERVER_IP     = "0.0.0.0"               # Bind to all interfaces
 SERVER_PORT   = 5005                    # UDP port
